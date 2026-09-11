@@ -1,6 +1,18 @@
 import net from "node:net";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 const SOCKS_PORT = Number(process.env.SOCKS_PORT) || 1080;
+const SOCKS_USER = process.env.SOCKS_USER || "";
+const SOCKS_PASS = process.env.SOCKS_PASS || "";
+const AUTH_REQUIRED = Boolean(SOCKS_USER && SOCKS_PASS);
+
+function sha256(value) {
+  return createHash("sha256").update(value, "utf8").digest();
+}
+
+function safeEqual(a, b) {
+  return timingSafeEqual(sha256(a), sha256(b));
+}
 
 function readExactly(socket, n, carry) {
   return new Promise((resolve, reject) => {
@@ -41,7 +53,37 @@ async function handleConnection(client) {
     let step = await readExactly(client, 2);
     const nmethods = step.data[1];
     step = await readExactly(client, nmethods, step.rest);
-    client.write(Buffer.from([5, 0]));
+    const methods = Array.from(step.data);
+
+    if (AUTH_REQUIRED) {
+      if (!methods.includes(2)) {
+        client.end(Buffer.from([5, 0xff]));
+        return;
+      }
+      client.write(Buffer.from([5, 2]));
+
+      step = await readExactly(client, 2, step.rest);
+      const ulen = step.data[1];
+      step = await readExactly(client, ulen, step.rest);
+      const uname = step.data.toString("utf8");
+      step = await readExactly(client, 1, step.rest);
+      const plen = step.data[0];
+      step = await readExactly(client, plen, step.rest);
+      const passwd = step.data.toString("utf8");
+
+      const ok = safeEqual(uname, SOCKS_USER) && safeEqual(passwd, SOCKS_PASS);
+      client.write(Buffer.from([1, ok ? 0 : 1]));
+      if (!ok) {
+        client.destroy();
+        return;
+      }
+    } else {
+      if (!methods.includes(0)) {
+        client.end(Buffer.from([5, 0xff]));
+        return;
+      }
+      client.write(Buffer.from([5, 0]));
+    }
 
     step = await readExactly(client, 4, step.rest);
     const cmd = step.data[1];
@@ -93,5 +135,8 @@ async function handleConnection(client) {
 
 const server = net.createServer(handleConnection);
 server.listen(SOCKS_PORT, () => {
+  if (!AUTH_REQUIRED) {
+    console.log("warning: SOCKS_USER/SOCKS_PASS not set, relay is running without authentication");
+  }
   console.log(`socks5 relay listening on ${SOCKS_PORT}`);
 });
